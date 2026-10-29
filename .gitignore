@@ -1,0 +1,17 @@
+.build/
+build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+.DS_Store
+xcuserdata/
+*.dSYM/
+.vscode/
+.idea/
+__pycache__/
+*.py[cod]
+
+# Full-width menu bar captures show every other app in the menu bar (and the clock);
+# only the cropped *-zoom variants are published.
+verification/screenshots/*-menubar*.png
+!verification/screenshots/*-zoom.png
