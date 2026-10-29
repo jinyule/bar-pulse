@@ -74,3 +74,7 @@ Sources/BarPulse/       应用：状态栏自绘视图、弹出面板、SwiftUI 
 Tests/                  单元测试与实机采样测试
 scripts/                构建、图标生成、端到端验证
 ```
+
+## 许可证
+
+[MIT](LICENSE)
