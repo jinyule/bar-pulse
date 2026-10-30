@@ -22,6 +22,8 @@ mkdir -p "$WORK/tools"
 swiftc -O scripts/verify/windows.swift -o "$WORK/tools/windows"
 swiftc -O scripts/verify/gpu-load.swift -o "$WORK/tools/gpu-load"
 swiftc -O scripts/verify/cursor.swift -o "$WORK/tools/cursor"
+swiftc -O scripts/verify/axframe.swift -o "$WORK/tools/axframe"
+swiftc -O scripts/verify/backdrop.swift -o "$WORK/tools/backdrop"
 
 if [[ " $* " != *" --no-ui "* ]]; then
   cua-driver status >/dev/null 2>&1 || { open -g -a CuaDriver --args serve; sleep 2; }

@@ -38,15 +38,43 @@ struct SettingsView: View {
                 Toggle("彩色指示条", isOn: $settings.colorful)
             }
 
+            Section {
+                Picker("仪表盘外观", selection: $settings.appearance) {
+                    ForEach(AppSettings.Appearance.allCases) { Text($0.title).tag($0) }
+                }
+                LabeledContent("透明度") {
+                    HStack {
+                        Slider(value: $settings.dashboardTransparency, in: AppSettings.transparencyRange)
+                            .labelsHidden()
+                            .accessibilityLabel("透明度")
+                        Text(Format.percent(settings.dashboardTransparency))
+                            .monospacedDigit()
+                            .frame(width: 36, alignment: .trailing)
+                    }
+                }
+                LabeledContent("面板大小") {
+                    HStack {
+                        Text(settings.dashboardSize.map { "\(Int($0.width)) × \(Int($0.height))" } ?? "默认")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                        Button("恢复默认") { settings.dashboardSize = nil }
+                            .disabled(settings.dashboardSize == nil)
+                    }
+                }
+            } header: {
+                Text("仪表盘")
+            } footer: {
+                Text("拖动仪表盘的左、右、下边缘或底部两角即可调整大小；透明度也可以在仪表盘底栏直接调节。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
             Section("通用") {
                 Picker("刷新频率", selection: $settings.refreshInterval) {
                     Text("1 秒").tag(1.0)
                     Text("2 秒").tag(2.0)
                     Text("3 秒").tag(3.0)
                     Text("5 秒").tag(5.0)
-                }
-                Picker("仪表盘外观", selection: $settings.appearance) {
-                    ForEach(AppSettings.Appearance.allCases) { Text($0.title).tag($0) }
                 }
                 Picker("温度单位", selection: $settings.temperatureUnit) {
                     Text("摄氏度 °C").tag(TemperatureUnit.celsius)
@@ -120,7 +148,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         super.init()
     }
 
-    func show() {
+    /// Opens the window centred on `screen` (where the user just clicked), or the main screen.
+    func show(on screen: NSScreen? = nil) {
         if window == nil {
             let host = NSHostingController(rootView: SettingsView(settings: settings, store: store))
             host.sizingOptions = [.preferredContentSize]
@@ -129,7 +158,14 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             window.styleMask = [.titled, .closable]
             window.isReleasedWhenClosed = false
             window.delegate = self
-            window.center()
+            if let area = screen?.visibleFrame {
+                // Like center(): horizontally centred, a little above the middle.
+                let size = window.frame.size
+                window.setFrameOrigin(NSPoint(x: (area.midX - size.width / 2).rounded(),
+                                              y: (area.minY + (area.height - size.height) * 2 / 3).rounded()))
+            } else {
+                window.center()
+            }
             self.window = window
         }
         applyAppearance()

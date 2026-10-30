@@ -4,8 +4,14 @@ import SwiftUI
 
 // MARK: - Containers
 
+extension EnvironmentValues {
+    /// Opacity of card surfaces; lowered when the user makes the dashboard more transparent.
+    @Entry var surfaceOpacity: Double = 1
+}
+
 struct Card<Content: View>: View {
     @ViewBuilder var content: Content
+    @Environment(\.surfaceOpacity) private var surfaceOpacity
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -16,12 +22,91 @@ struct Card<Content: View>: View {
         .background {
             // A fairly solid surface keeps text legible on top of the popover's glass.
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(.background.opacity(0.72))
+                .fill(.background.opacity(0.72 * surfaceOpacity))
                 .overlay {
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .strokeBorder(Color.primary.opacity(0.07), lineWidth: 0.5)
                 }
         }
+    }
+}
+
+/// Stacks rows vertically for a resizable window. At the rows' ideal height each row gets exactly
+/// its ideal height; below it every row shrinks toward its minimum at the same rate, and above it
+/// the extra height is shared evenly by the rows that can grow (the ones holding charts).
+struct StretchColumn: Layout {
+    var spacing: CGFloat = 12
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let heights = rowHeights(width: proposal.width, height: proposal.height, subviews: subviews)
+        let width = proposal.width ?? subviews.map { $0.sizeThatFits(.unspecified).width }.max() ?? 0
+        return CGSize(width: width, height: heights.reduce(0, +) + totalSpacing(subviews))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var y = bounds.minY
+        for (subview, height) in zip(subviews, rowHeights(width: bounds.width, height: bounds.height, subviews: subviews)) {
+            subview.place(at: CGPoint(x: bounds.minX, y: y), proposal: ProposedViewSize(width: bounds.width, height: height))
+            y += height + spacing
+        }
+    }
+
+    private func totalSpacing(_ subviews: Subviews) -> CGFloat {
+        spacing * CGFloat(max(0, subviews.count - 1))
+    }
+
+    private func rowHeights(width: CGFloat?, height: CGFloat?, subviews: Subviews) -> [CGFloat] {
+        let ideal = subviews.map { $0.sizeThatFits(ProposedViewSize(width: width, height: nil)).height }
+        guard let height else { return ideal }
+        let available = height - totalSpacing(subviews)
+        let idealTotal = ideal.reduce(0, +)
+        if available < idealTotal {
+            let minimum = subviews.map { $0.sizeThatFits(ProposedViewSize(width: width, height: 0)).height }
+            let minimumTotal = minimum.reduce(0, +)
+            let fraction = idealTotal > minimumTotal ? max(0, (available - minimumTotal) / (idealTotal - minimumTotal)) : 0
+            return zip(minimum, ideal).map { $0 + ($1 - $0) * fraction }
+        }
+        let maximum = subviews.map { $0.sizeThatFits(ProposedViewSize(width: width, height: .infinity)).height }
+        let growable = subviews.indices.filter { maximum[$0] > ideal[$0] + 0.5 }
+        guard !growable.isEmpty else { return ideal }
+        let extra = (available - idealTotal) / CGFloat(growable.count)
+        var heights = ideal
+        for index in growable {
+            heights[index] = min(maximum[index], ideal[index] + extra)
+        }
+        return heights
+    }
+}
+
+/// Two views side by side, top-aligned; the first always takes `fraction` of the width.
+struct SplitRow: Layout {
+    var fraction: CGFloat
+    var spacing: CGFloat = 12
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let width = proposal.width else {
+            let sizes = subviews.map { $0.sizeThatFits(.unspecified) }
+            return CGSize(width: sizes.map(\.width).reduce(0, +) + spacing * CGFloat(max(0, sizes.count - 1)),
+                          height: sizes.map(\.height).max() ?? 0)
+        }
+        let heights = zip(subviews, widths(width)).map { subview, width in
+            subview.sizeThatFits(ProposedViewSize(width: width, height: proposal.height)).height
+        }
+        return CGSize(width: width, height: heights.max() ?? 0)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX
+        for (subview, width) in zip(subviews, widths(bounds.width)) {
+            subview.place(at: CGPoint(x: x, y: bounds.minY), proposal: ProposedViewSize(width: width, height: bounds.height))
+            x += width + spacing
+        }
+    }
+
+    private func widths(_ total: CGFloat) -> [CGFloat] {
+        let available = max(0, total - spacing)
+        let first = (available * fraction).rounded()
+        return [first, available - first]
     }
 }
 
@@ -316,6 +401,7 @@ struct StatItem: View {
     let title: String
     let value: String
     var dot: Color?
+    var isPrivate = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -331,6 +417,7 @@ struct StatItem: View {
                 .font(.system(size: 12, weight: .semibold, design: .rounded))
                 .monospacedDigit()
                 .lineLimit(1)
+                .privacySensitive(isPrivate)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -463,5 +550,32 @@ struct FooterButton: View {
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
         .animation(.easeOut(duration: 0.15), value: hovering)
+    }
+}
+
+/// Footer slider for the dashboard's transparency, so the effect can be judged while adjusting it.
+struct TransparencyControl: View {
+    @Binding var value: Double
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "circle.lefthalf.filled")
+                .foregroundStyle(.secondary)
+            Slider(value: $value, in: AppSettings.transparencyRange) {
+                Text("透明度")
+            }
+            .labelsHidden()
+            .controlSize(.mini)
+            .frame(width: 76)
+            Text(Format.percent(value))
+                .monospacedDigit()
+                .frame(width: 28, alignment: .trailing)
+        }
+        .font(.system(size: 11, weight: .medium))
+        .padding(.leading, 9)
+        .padding(.trailing, 10)
+        .padding(.vertical, 4)
+        .background(Capsule().fill(Color.primary.opacity(0.06)))
+        .help("面板透明度")
     }
 }

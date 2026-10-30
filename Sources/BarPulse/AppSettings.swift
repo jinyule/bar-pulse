@@ -47,7 +47,13 @@ final class AppSettings {
         static let interval = "refreshInterval"
         static let unit = "temperatureUnit"
         static let appearance = "appearance"
+        static let transparency = "dashboardTransparency"
+        static let width = "dashboardWidth"
+        static let height = "dashboardHeight"
     }
+
+    /// 0 is the fully frosted panel; the cap keeps the cards from vanishing completely.
+    static let transparencyRange: ClosedRange<Double> = 0...0.9
 
     @ObservationIgnored private let defaults: UserDefaults
     /// Called after any persisted value changes.
@@ -72,6 +78,24 @@ final class AppSettings {
     var appearance: Appearance {
         didSet { defaults.set(appearance.rawValue, forKey: Key.appearance); onChange?() }
     }
+    /// How much of the desktop shows through the dashboard's background and cards.
+    var dashboardTransparency: Double {
+        didSet { defaults.set(dashboardTransparency, forKey: Key.transparency); onChange?() }
+    }
+    /// The size the user dragged the dashboard to; `nil` means its natural size.
+    var dashboardSize: CGSize? {
+        didSet {
+            guard dashboardSize != oldValue else { return }
+            if let dashboardSize {
+                defaults.set(Double(dashboardSize.width), forKey: Key.width)
+                defaults.set(Double(dashboardSize.height), forKey: Key.height)
+            } else {
+                defaults.removeObject(forKey: Key.width)
+                defaults.removeObject(forKey: Key.height)
+            }
+            onChange?()
+        }
+    }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -82,6 +106,10 @@ final class AppSettings {
         refreshInterval = interval > 0 ? interval : 1
         temperatureUnit = defaults.string(forKey: Key.unit).flatMap(TemperatureUnit.init(rawValue:)) ?? .celsius
         appearance = defaults.string(forKey: Key.appearance).flatMap(Appearance.init(rawValue:)) ?? .system
+        let transparency = defaults.object(forKey: Key.transparency) as? Double ?? 0
+        dashboardTransparency = min(max(transparency, Self.transparencyRange.lowerBound), Self.transparencyRange.upperBound)
+        let width = defaults.double(forKey: Key.width), height = defaults.double(forKey: Key.height)
+        dashboardSize = width > 0 && height > 0 ? CGSize(width: width, height: height) : nil
     }
 
     var visibleMetrics: [Metric] {

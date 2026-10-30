@@ -6,6 +6,12 @@
 3. Launches the real app, opens it through the menu bar's accessibility tree (the same press the
    menu bar performs for a mouse click), switches styles live in its settings window and captures
    real screenshots of the screen.
+4. Clicks the dashboard's transparency slider and drags its edges with mouse events posted to the
+   app, and checks the saved values, the window frames and (against a known backdrop) how much
+   shows through.
+
+All UI work happens on the display Cua Driver records, never the main one, without taking
+keyboard focus, so the user can keep working on the main display meanwhile.
 
 Screenshots come from Cua Driver's ScreenCaptureKit display recording, so this needs a running
 `cua-driver` daemon with Screen Recording + Accessibility, and an unlocked screen (a locked session
@@ -310,56 +316,86 @@ def launch_app(*args: str) -> int:
 
 
 class MenuBar:
-    """The menu bar showing BarPulse, hosted by MenuBarAgent on macOS 26+.
+    """The menu bar of the recorded display, drawn by MenuBarAgent on macOS 26+.
 
-    Every display has its own menu bar, and a crowded one (e.g. a notched laptop screen) folds
-    items behind its overflow button, so look for the bar that actually shows the item.
+    Every display has its own menu bar, but status items only show in the active one, which
+    follows the user's clicks. The checks run on the recorded display while the user may keep
+    working on another one, so before the item is needed it is brought over with a click on an
+    empty stretch of this bar (the pointer goes straight back; the frontmost app doesn't change).
     """
 
-    def __init__(self) -> None:
-        bar = wait_until(self._locate, 15)
-        assert bar, "BarPulse status item not found in any menu bar"
+    def __init__(self, display: "Display") -> None:
+        bar = wait_until(lambda: next((w for w in windows("MenuBarAgent") if w["layer"] == 24
+                                       and abs(w["x"] - display.x) < 1 and abs(w["y"] - display.y) < 1), None), 10)
+        assert bar, "no menu bar on the recorded display"
+        self.display = display
         self.pid, self.window = bar["pid"], bar["id"]
         self.x, self.y, self.w, self.height = bar["x"], bar["y"], bar["w"], int(bar["h"])
+        self.last_item: dict | None = None
 
-    @staticmethod
-    def _index(pid: int, window: int) -> int | None:
-        tree = cua("get_window_state", {"pid": pid, "window_id": window, "capture_mode": "ax"}).get("tree_markdown", "")
+    def item_frame(self) -> dict | None:
+        """The status item's frame, if it is showing in this menu bar."""
+        found = next((f for f in ax_frames(self.pid, "BarPulse") if f["role"] == "AXButton"
+                      and self.x <= f["x"] < self.x + self.w and self.y <= f["y"] < self.y + self.height), None)
+        self.last_item = found or self.last_item
+        return found
+
+    def summon(self) -> None:
+        if self.item_frame():
+            return
+        home = cursor()
+        cursor((self.x + self.w * 0.45, self.y + self.height / 2), click=True)
+        cursor(home)
+        assert wait_until(self.item_frame, 5), "BarPulse status item did not move to the recorded display"
+
+    def status_item_index(self) -> int | None:
+        tree = cua("get_window_state", {"pid": self.pid, "window_id": self.window, "capture_mode": "ax"}).get("tree_markdown", "")
         match = re.search(r'\[(\d+)\] AXButton "BarPulse"', tree)
         return int(match.group(1)) if match else None
 
-    def _locate(self) -> dict | None:
-        # (Menu bar windows don't report themselves as on screen, so don't filter on that.)
-        bars = [w for w in windows("MenuBarAgent") if w["layer"] == 24]
-        return next((bar for bar in bars if self._index(bar["pid"], bar["id"]) is not None), None)
-
-    def status_item_index(self) -> int | None:
-        return self._index(self.pid, self.window)
-
     def press_status_item(self) -> None:
+        self.summon()
         index = wait_until(self.status_item_index, 10)
         assert index is not None, "BarPulse status item not found in the menu bar"
         cua("click", {"pid": self.pid, "window_id": self.window, "element_index": index})
 
 
-def popover_window() -> dict | None:
+def dashboard_window() -> dict | None:
     found = [w for w in windows("BarPulse") if w["layer"] > 0 and w["w"] > 300 and w["onscreen"]]
     return found[0] if found else None
 
 
+def press_item_anywhere() -> None:
+    """AX-presses the status item in whichever menu bar shows it (used to close a stray panel)."""
+    for bar in (w for w in windows("MenuBarAgent") if w["layer"] == 24):
+        tree = cua("get_window_state", {"pid": bar["pid"], "window_id": bar["id"], "capture_mode": "ax"}).get("tree_markdown", "")
+        match = re.search(r'\[(\d+)\] AXButton "BarPulse"', tree)
+        if match:
+            cua("click", {"pid": bar["pid"], "window_id": bar["id"], "element_index": int(match.group(1))})
+            return
+
+
 def open_dashboard(menubar: MenuBar) -> dict:
-    if not popover_window():
-        menubar.press_status_item()
-    window = wait_until(popover_window, 8)
-    assert window, "dashboard popover did not open"
-    time.sleep(1.2)  # let the open animation finish
-    return popover_window() or window
+    """Opens the dashboard on the recorded display, retrying if a click elsewhere interferes."""
+    for _ in range(4):
+        if not dashboard_window():
+            menubar.press_status_item()
+        window = wait_until(dashboard_window, 8)
+        if window and not menubar.display.contains(window["x"] + 1, window["y"] + 1):
+            # The active menu bar moved to another display between summoning and pressing.
+            press_item_anywhere()
+            wait_until(lambda: dashboard_window() is None, 5)
+            continue
+        time.sleep(1.2)  # let the open animation finish
+        if dashboard_window():
+            return dashboard_window()
+    raise AssertionError("dashboard did not stay open on the recorded display")
 
 
 def close_dashboard(menubar: MenuBar) -> None:
-    if popover_window():
-        menubar.press_status_item()
-        wait_until(lambda: popover_window() is None, 5)
+    if dashboard_window():
+        press_item_anywhere()
+        wait_until(lambda: dashboard_window() is None, 5)
 
 
 class Display:
@@ -383,14 +419,21 @@ class Display:
 
 
 def record_video(tag: str, seconds: float) -> tuple[Path, Display]:
-    """Records a display with Cua Driver and returns the video plus the display it shows.
+    """Records a display with Cua Driver for `seconds` and returns the video plus the display it shows."""
+    return record_during(tag, lambda: time.sleep(seconds))
+
+
+def record_during(tag: str, action, pad: float = 0) -> tuple[Path, Display]:
+    """Records a display with Cua Driver while `action` runs (plus `pad` seconds on either side).
 
     Cua Driver picks the display itself, so identify it by the recording's pixel size.
     """
     folder = WORK / f"rec-{tag}"
     shutil.rmtree(folder, ignore_errors=True)
     cua("start_recording", {"output_dir": str(folder), "record_video": True})
-    time.sleep(seconds)
+    time.sleep(pad)
+    action()
+    time.sleep(pad)
     state = cua("stop_recording", {})
     video = Path(state.get("last_video_path") or folder / "recording.mp4")
     wait_until(lambda: video.exists() and video.stat().st_size > 0, 10)
@@ -401,6 +444,79 @@ def record_video(tag: str, seconds: float) -> tuple[Path, Display]:
              if d.pixel_size == (width, height)]
     assert found, f"recording is {width}×{height}, which matches no active display"
     return video, found[0]
+
+
+class Backdrop:
+    """A fixed picture behind the dashboard while it's being photographed.
+
+    Screenshots then show the same wallpaper through the glass instead of whatever windows happen
+    to be open (which would otherwise end up in the committed images), and transparency can be
+    measured against a known background. It floats above normal windows and below the menu bar.
+    """
+
+    IMAGE = Path("/System/Library/Desktop Pictures/Sonoma.heic")
+
+    def __init__(self, display: Display, menubar: "MenuBar") -> None:
+        top = menubar.y + menubar.height
+        self.rect = (display.x, top, display.w, display.y + display.h - top)
+        self.proc: subprocess.Popen | None = None
+
+    def __enter__(self) -> "Backdrop":
+        if self.IMAGE.exists():
+            self.proc = subprocess.Popen([str(TOOLS / "backdrop"), *map(str, self.rect), str(self.IMAGE)])
+            wait_until(lambda: any(w["onscreen"] for w in windows("backdrop")), 5)
+            time.sleep(0.5)
+        return self
+
+    def __exit__(self, *_) -> None:
+        if self.proc:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+            self.proc = None
+
+
+def region_rgb(frame: Frame, region: tuple[float, float, float, float], width: int = 160) -> bytes:
+    """A region of a captured frame (global points), downscaled to `width` pixels, as raw RGB."""
+    x, y, w, h = frame.display.pixels(*region)
+    height = max(2, int(h * width / max(w, 1)) // 2 * 2)
+    return subprocess.run(["ffmpeg", "-v", "error", "-i", str(frame.path), "-vf",
+                           f"crop={w}:{h}:{x}:{y},scale={width}:{height}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                          capture_output=True, check=True).stdout
+
+
+def mean_difference(a: bytes, b: bytes) -> float:
+    """Mean absolute difference per colour channel (0–255) between two equally sized images."""
+    return sum(abs(p - q) for p, q in zip(a, b)) / max(1, min(len(a), len(b)))
+
+
+def hide_other_items(menubar: MenuBar, display: Display, region: tuple[float, float, float, float]) -> str:
+    """ffmpeg filters, run right after cropping `region`, that blur the menu bar in it except BarPulse.
+
+    The other status items say what else the user runs, which has no place in published images
+    (the full-width menu bar captures are git-ignored for the same reason).
+    """
+    x, y, w, h = display.pixels(*region)
+    s = display.scale
+    rows = min(h, int((menubar.y + menubar.height - display.y) * s) - y)
+    if rows <= 0:
+        return ""
+    blur = f"[bar]crop={w}:{rows}:0:0,gblur=sigma={8 * s:g}[blurred];[base][blurred]overlay=0:0"
+    item = menubar.item_frame() or menubar.last_item
+    left = max(0, int((item["x"] - 6 - display.x) * s) - x) if item else w
+    right = min(w, int((item["x"] + item["w"] + 6 - display.x) * s) - x) if item else 0
+    if right - left < 2:
+        return f",split[base][bar];{blur}"
+    return f",split=3[base][bar][item];{blur}[out];[item]crop={right - left}:{rows}:{left}:0[sharp];[out][sharp]overlay={left}:0"
+
+
+def gif(video: Path, display: Display, region: tuple[float, float, float, float], dst: Path, width: int = 420,
+        menubar: MenuBar | None = None) -> None:
+    x, y, w, h = display.pixels(*region)
+    hide = hide_other_items(menubar, display, region) if menubar else ""
+    run(["ffmpeg", "-v", "error", "-y", "-i", str(video), "-vf",
+         f"crop={w}:{h}:{x}:{y}{hide},fps=12,scale={width}:-1:flags=lanczos,split[a][b];"
+         "[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4:diff_mode=rectangle",
+         str(dst)], check=True)
 
 
 def cursor(move_to: tuple[float, float] | None = None, click: bool = False) -> tuple[float, float]:
@@ -448,38 +564,65 @@ def capture_screen(tag: str, region: tuple[float, float, float, float], seconds:
     return Frame(frame, display)
 
 
-def crop(frame: Frame, dst: Path, region: tuple[float, float, float, float], ppp: float | None = None) -> Path:
-    """Crops a global point rect out of a frame; `ppp` = output pixels per point (default: native)."""
+def crop(frame: Frame, dst: Path, region: tuple[float, float, float, float], ppp: float | None = None,
+         menubar: MenuBar | None = None) -> Path:
+    """Crops a global point rect out of a frame; `ppp` = output pixels per point (default: native).
+
+    With `menubar`, the rest of the menu bar is blurred around the status item (see hide_other_items).
+    """
     x, y, w, h = frame.display.pixels(*region)
     filters = f"crop={w}:{h}:{x}:{y}"
+    if menubar:
+        filters += hide_other_items(menubar, frame.display, region)
     if ppp and ppp != frame.display.scale:
         filters += f",scale=iw*{ppp / frame.display.scale}:ih*{ppp / frame.display.scale}:flags=lanczos"
     run(["ffmpeg", "-v", "error", "-y", "-i", str(frame.path), "-vf", filters, str(dst)], check=True)
     return dst
 
 
+def ax_frames(pid: int, title: str) -> list[dict]:
+    """Screen frames (global top-left points) of a process's accessibility elements with this title."""
+    return json.loads(run([str(TOOLS / "axframe"), str(pid), title]).stdout or "[]")
+
+
 def item_center(menubar: MenuBar) -> float:
-    """The popover's arrow points at the status item, so its centre is the item's centre."""
-    window = open_dashboard(menubar)
-    close_dashboard(menubar)
-    return window["x"] + window["w"] / 2
+    """Centre of the BarPulse status item, from the menu bar's accessibility tree."""
+    menubar.summon()
+    time.sleep(1)  # a style change resizes the item; let the menu bar lay it out again
+    item = menubar.item_frame()
+    assert item, "BarPulse status item has no frame in the menu bar"
+    return item["x"] + item["w"] / 2
 
 
 def menubar_shots(menubar: MenuBar, center: float, name: str, frame: Frame | None = None, zoom: float = 300) -> None:
     item = (center - zoom / 2, menubar.y, zoom, menubar.height)
-    frame = frame or capture_screen(name, item)
+    if not frame:
+        menubar.summon()
+        frame = capture_screen(name, item)
     left = max(menubar.x, center - 420)
     crop(frame, SHOTS / f"{name}.png", (left, menubar.y, menubar.x + menubar.w - left, menubar.height), 2)
     crop(frame, SHOTS / f"{name}-zoom.png", item, 4)
 
 
+def steady(menubar: MenuBar, step):
+    """Runs `step(dashboard window)`, again if a click elsewhere closed the dashboard meanwhile.
+
+    The panel closes on any click outside it, like a menu, and the user may be clicking away on
+    another display while the checks run.
+    """
+    for _ in range(3):
+        result = step(open_dashboard(menubar))
+        if dashboard_window():
+            return result
+    raise AssertionError("dashboard kept closing during a step (clicks elsewhere?)")
+
+
 def dashboard_shot(menubar: MenuBar, name: str) -> tuple[dict, Frame]:
-    window = open_dashboard(menubar)
-    frame = capture_screen(name, (window["x"], window["y"], window["w"], window["h"]))
+    window, frame = steady(menubar, lambda window: (window, capture_screen(name, (window["x"], window["y"], window["w"], window["h"]))))
     margin = 36
-    top = frame.display.y  # include the menu bar the popover hangs from
+    top = frame.display.y  # include the menu bar the panel hangs from
     crop(frame, SHOTS / f"{name}.png",
-         (window["x"] - margin, top, window["w"] + 2 * margin, window["y"] + window["h"] + margin - top))
+         (window["x"] - margin, top, window["w"] + 2 * margin, window["y"] + window["h"] + margin - top), menubar=menubar)
     return window, frame
 
 
@@ -518,20 +661,27 @@ def ax_press(pid: int, window_id: int, pattern: str) -> bool:
     return bool(match)
 
 
-def open_settings(pid: int, dashboard: dict, park: tuple[float, float]) -> dict | None:
-    """Presses the dashboard's 设置 button; returns the settings window once it's on screen."""
+def open_settings(pid: int, dashboard: dict) -> dict | None:
+    """Presses the dashboard's 设置 button; returns the settings window once it's on screen.
+
+    An accessibility press isn't user input, so macOS declines to activate the app: the window
+    renders inactive (grey controls) and keyboard focus stays wherever the user has it.
+    """
     tree = dashboard_texts(pid, dashboard)
     button = re.search(r'\[(\d+)\] AXButton[^\n]*设置', tree)
     if button:
         cua("click", {"pid": pid, "window_id": dashboard["id"], "element_index": int(button.group(1))})
     settings = wait_until(lambda: next((w for w in windows("BarPulse") if w["layer"] == 0 and w["h"] > 200 and w["onscreen"]), None), 8)
     if settings:
-        # An accessibility press isn't user input, so macOS declines to activate the app and the
-        # window would render inactive (grey controls). Click its title bar like a user would.
-        cursor((settings["x"] + settings["w"] / 2, settings["y"] + 14), click=True)
-        cursor(park)
         time.sleep(1.5)
     return settings
+
+
+def front_app() -> str:
+    """Name of the frontmost app (the one with keyboard focus)."""
+    out = run(["lsappinfo", "info", "-only", "name", run(["lsappinfo", "front"]).stdout.strip()]).stdout
+    match = re.search(r'"?(?:LSDisplayName|name)"?\s*=\s*"([^"]*)"', out) or re.search(r'"([^"]+)"', out)
+    return match.group(1) if match else out.strip()
 
 
 def read_default(key: str) -> str:
@@ -556,28 +706,40 @@ def ui_checks(info: dict) -> None:
     SHOTS.mkdir(parents=True, exist_ok=True)
     run(["defaults", "delete", BUNDLE_ID])
 
-    # Status items live in the menu bar of the display under the mouse; a crowded one (e.g. a
-    # notched laptop screen) folds BarPulse into its overflow. Work on the display being recorded.
-    # The pointer is parked at the display's left edge, clear of the item, popover and windows.
+    # Everything happens on the display Cua Driver records, never on the main display, so the user
+    # can keep working there: the dashboard, settings window and backdrop all open on the recorded
+    # display, the panel is driven with accessibility presses and events posted straight to the
+    # app, and nothing takes keyboard focus. The pointer only moves for the brief menu bar clicks
+    # that bring the status item over (see MenuBar.summon).
     _, display = record_video("probe", 1)
-    home = cursor()
-    park = (display.x + 24, display.y + display.h / 2)
-    cursor(park)
-    try:
-        ui_flow(info, section, park)
-    finally:
-        cursor(home)
+    screens = json.loads(run([str(TOOLS / "windows"), "--displays"]).stdout)
+    main = next(d for d in screens if d["main"])
+    if len(screens) > 1 and (display.x, display.y) == (main["x"], main["y"]):
+        record(section, "在副显示器上验证", False, "Cua Driver 录制的是主显示器", "界面验证只在副显示器上进行，以免打扰主显示器上的工作")
+        return
+    ui_flow(info, section, display)
 
 
-def ui_flow(info: dict, section: str, park: tuple[float, float]) -> None:
-
-    pid = launch_app()
-    menubar = MenuBar()
+def ui_flow(info: dict, section: str, display: Display) -> None:
+    # The screenshots get published: the app blanks out the local IP address.
+    pid = launch_app("--redact-private")
+    menubar = MenuBar(display)
+    menubar.summon()
     record(section, "状态栏项出现在菜单栏 (MenuBarAgent AX)", wait_until(menubar.status_item_index, 10) is not None,
            f"pid {pid}")
     time.sleep(2)
     center = item_center(menubar)
-    record(section, "点击状态栏项打开仪表盘", True, f"面板中心 x={center:.0f}")
+    front = front_app()
+    window = open_dashboard(menubar)
+    after = front_app()
+    record(section, "打开仪表盘不抢前台应用和键盘焦点", after == front, f"打开前后前台应用：{front} → {after}")
+    close_dashboard(menubar)
+    # Centred under the item, unless that would push it past the screen edge (8 pt margin).
+    middle = window["x"] + window["w"] / 2
+    edge = window["x"] <= display.x + 8.5 or window["x"] + window["w"] >= display.x + display.w - 8.5
+    gap = window["y"] - (menubar.y + menubar.height)
+    record(section, "点击状态栏项打开仪表盘，面板挂在状态栏项正下方", (abs(middle - center) <= 2 or edge) and 0 <= gap <= 12,
+           f'面板 {window["w"]}×{window["h"]}，中心 x={middle:.0f}，距菜单栏 {gap:.0f} pt', f"状态栏项中心 x={center:.0f}")
     menubar_shots(menubar, center, "01-menubar")
 
     # Idle period doubles as the app's own overhead measurement (dashboard closed).
@@ -590,20 +752,22 @@ def ui_flow(info: dict, section: str, park: tuple[float, float]) -> None:
     load = Load().cpu(info["cpuCores"] // 2).gpu(24).net(24)
     try:
         time.sleep(10)
-        window, frame = dashboard_shot(menubar, "03-dashboard-under-load")
-        menubar_shots(menubar, center, "03-menubar-under-load", frame)
-        tree = dashboard_texts(pid, window)
-        cpu_text = re.search(r'AXStaticText = "CPU"\n.*\n\s*- AXStaticText = "(\d+)%"', tree)
-        busy = dump(1.0)["snapshot"]
-        record(section, "负载期间仪表盘 CPU 读数 (界面文本)", bool(cpu_text) and int(cpu_text.group(1)) >= 30,
-               f'{cpu_text.group(1) if cpu_text else "?"}%', f'dump {busy["cpu"]["usage"]:.0%}')
+        with Backdrop(display, menubar):
+            window, frame = dashboard_shot(menubar, "03-dashboard-under-load")
+            menubar_shots(menubar, center, "03-menubar-under-load", frame)
+            tree = dashboard_texts(pid, window)
+            cpu_text = re.search(r'AXStaticText = "CPU"\n.*\n\s*- AXStaticText = "(\d+)%"', tree)
+            busy = dump(1.0)["snapshot"]
+            record(section, "负载期间仪表盘 CPU 读数 (界面文本)", bool(cpu_text) and int(cpu_text.group(1)) >= 30,
+                   f'{cpu_text.group(1) if cpu_text else "?"}%', f'dump {busy["cpu"]["usage"]:.0%}')
 
-        # Short clip proving the readouts animate in real time.
-        video, display = record_video("clip", 6)
+            # Short clip proving the readouts animate in real time.
+            video, display = record_video("clip", 6)
         top = display.y
-        x, y, w, h = display.pixels(window["x"] - 36, top, window["w"] + 72, window["y"] + window["h"] + 36 - top)
+        region = (window["x"] - 36, top, window["w"] + 72, window["y"] + window["h"] + 36 - top)
+        x, y, w, h = display.pixels(*region)
         run(["ffmpeg", "-v", "error", "-y", "-i", str(video), "-vf",
-             f"crop={w}:{h}:{x}:{y},fps=15,scale=iw/{display.scale}:-2",
+             f"crop={w}:{h}:{x}:{y}{hide_other_items(menubar, display, region)},fps=15,scale=iw/{display.scale}:-2",
              "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "26", str(SHOTS / "live-dashboard.mp4")], check=True)
         x, y, w, h = display.pixels(center - 150, menubar.y, 300, menubar.height)
         run(["ffmpeg", "-v", "error", "-y", "-i", str(video), "-vf",
@@ -614,7 +778,8 @@ def ui_flow(info: dict, section: str, park: tuple[float, float]) -> None:
         load.stop()
 
     time.sleep(25)
-    window, _ = dashboard_shot(menubar, "02-dashboard")
+    with Backdrop(display, menubar):
+        window, _ = dashboard_shot(menubar, "02-dashboard")
     tree = dashboard_texts(pid, window)
     data = dump(1.0)["snapshot"]
     used_text = re.search(r'AXStaticText = "([\d.]+) GB"\n\s*- AXStaticText = "已使用"', tree)
@@ -633,13 +798,15 @@ def ui_flow(info: dict, section: str, park: tuple[float, float]) -> None:
            f"CPU {cpu:.2f}%，内存 {memory:.0f} MB", "阈值 CPU < 12%，内存 < 250 MB")
 
     # Settings, opened from the dashboard's own button.
-    settings = open_settings(pid, popover_window() or window, park)
-    record(section, "点击「设置」打开设置窗口", bool(settings), f'{int(settings["w"])}×{int(settings["h"])}' if settings else "未打开")
+    settings = open_settings(pid, open_dashboard(menubar))
+    record(section, "点击「设置」打开设置窗口，出现在状态栏项所在的显示器", bool(settings) and display.contains(settings["x"] + 1, settings["y"] + 1),
+           f'{int(settings["w"])}×{int(settings["h"])}，位于 ({settings["x"]:.0f}, {settings["y"]:.0f})' if settings else "未打开")
     if not settings:
         return
-    frame = capture_screen("04-settings", (settings["x"], settings["y"], settings["w"], settings["h"]))
-    m = 30
-    crop(frame, SHOTS / "04-settings.png", (settings["x"] - m, settings["y"] - m, settings["w"] + 2 * m, settings["h"] + 2 * m))
+    # Just the window (ScreenCaptureKit window capture, transparent corners): a normal window can
+    # always end up behind other windows, which then must not show up in the screenshot.
+    cua("get_window_state", {"pid": pid, "window_id": settings["id"], "capture_mode": "vision",
+                             "screenshot_out_file": str(SHOTS / "04-settings.png")})
 
     # Everything below is switched live in the settings window, so it also checks that settings
     # apply immediately (no relaunch). Form labels are separate texts in front of their controls;
@@ -681,17 +848,195 @@ def ui_flow(info: dict, section: str, park: tuple[float, float]) -> None:
     finally:
         load.stop()
     time.sleep(6)
-    window, _ = dashboard_shot(menubar, "05-dashboard-dark")
+    with Backdrop(display, menubar):
+        window, _ = dashboard_shot(menubar, "05-dashboard-dark")
     record(section, "设置切换深色仪表盘", pressed and read_default("appearance") == "dark",
            f"appearance = {read_default('appearance')}", "screenshots/05-dashboard-dark.png")
 
     # Back to the defaults, through the same UI.
-    settings = open_settings(pid, window, park)
+    settings = open_settings(pid, open_dashboard(menubar))
     if settings:
         if press(appearance):
             press(r'\[(\d+)\] AXMenuItem "跟随系统"')
         close_settings()
+
+    panel_checks(pid, menubar, display)
     run(["defaults", "delete", BUNDLE_ID])
+    launch_app()  # leave it running as usual, showing the IP again
+
+
+TRANSPARENCY_MAX = 0.9  # AppSettings.transparencyRange
+MIN_WIDTH = 640         # DashboardView's minWidth
+
+
+def drag(pid: int, window: dict, display: Display, start: tuple[float, float], end: tuple[float, float], ms: int = 500) -> None:
+    """Drags inside a window (global points) with mouse events posted straight to the app.
+
+    They go through AppKit's normal event handling, but the user's pointer stays where it is.
+    """
+    def local(point: tuple[float, float]) -> tuple[float, float]:
+        return (point[0] - window["x"]) * display.scale, (point[1] - window["y"]) * display.scale
+
+    (fx, fy), (tx, ty) = local(start), local(end)
+    cua("drag", {"pid": pid, "window_id": window["id"], "from_x": fx, "from_y": fy, "to_x": tx, "to_y": ty,
+                 "duration_ms": ms, "steps": min(200, max(20, ms // 16))})
+    time.sleep(0.4)
+
+
+def click_at(pid: int, window: dict, display: Display, point: tuple[float, float]) -> None:
+    """Clicks inside a window (global points) with mouse events posted straight to the app."""
+    cua("click", {"pid": pid, "window_id": window["id"],
+                  "x": (point[0] - window["x"]) * display.scale, "y": (point[1] - window["y"]) * display.scale})
+
+
+def transparency_slider(pid: int, window: dict) -> dict:
+    """Frame of the dashboard footer's transparency slider."""
+    return next(f for f in ax_frames(pid, "透明度") if f["role"] == "AXSlider"
+                and window["x"] <= f["x"] < window["x"] + window["w"] and window["y"] <= f["y"] < window["y"] + window["h"])
+
+
+def set_transparency(pid: int, window: dict, display: Display, value: float, slider: dict | None = None) -> float:
+    """Clicks the dashboard footer's transparency slider where `value` lies; returns the saved value.
+
+    The knob jumps to a click on its track. (Dragging the knob works too, but SwiftUI's slider
+    follows the real pointer while dragging, and these checks leave the pointer alone.)
+    """
+    slider = slider or transparency_slider(pid, window)
+    knob = 7.5  # the knob's centre travels between half-knob insets at either end of the track
+    fraction = min(1.0, max(0.0, value / TRANSPARENCY_MAX))
+    x = slider["x"] + 1 if fraction == 0 else slider["x"] + slider["w"] - 1 if fraction == 1 else \
+        slider["x"] + knob + (slider["w"] - 2 * knob) * fraction
+    click_at(pid, window, display, (x, slider["y"] + slider["h"] / 2))
+    time.sleep(0.3)
+    return float(read_default("dashboardTransparency") or 0)
+
+
+def drag_edge(pid: int, window: dict, display: Display, edge: str, dx: float, dy: float, ms: int = 500) -> dict:
+    """Drags a dashboard edge ("left", "right", "bottom", or "corner" for bottom-right) by (dx, dy)."""
+    x, y, w, h = window["x"], window["y"], window["w"], window["h"]
+    start = {"left": (x + 3, y + h / 2), "right": (x + w - 3, y + h / 2),
+             "bottom": (x + w / 2, y + h - 3), "corner": (x + w - 8, y + h - 8)}[edge]
+    drag(pid, window, display, start, (start[0] + dx, start[1] + dy), ms)
+    return dashboard_window() or window
+
+
+def panel_checks(pid: int, menubar: MenuBar, display: Display) -> None:
+    """Transparency and resizing, dragged the way a user would."""
+    section = "面板透明度与大小"
+    print(f"\n== {section}", flush=True)
+    margin = 36
+
+    def size(window: dict) -> str:
+        return f'{window["w"]}×{window["h"]}'
+
+    def bounds(window: dict) -> tuple[float, float, float, float]:
+        return window["x"], window["y"], window["w"], window["h"]
+
+    def around(window: dict) -> tuple[float, float, float, float]:
+        """The panel plus a margin, from the top of the display (so the menu bar is included)."""
+        return window["x"] - margin, display.y, window["w"] + 2 * margin, window["y"] + window["h"] + margin - display.y
+
+    def capture(name: str) -> tuple[dict, Frame]:
+        return steady(menubar, lambda window: (window, capture_screen(name, bounds(window))))
+
+    def resize(edge: str, dx: float, dy: float) -> tuple[dict, dict]:
+        return steady(menubar, lambda window: (window, drag_edge(pid, window, display, edge, dx, dy)))
+
+    with Backdrop(display, menubar):
+        natural, opaque = capture("panel-opaque")
+        record(section, "默认大小为内容的理想尺寸", natural["w"] == 660, size(natural), "宽 660 pt，与改版前一致")
+
+        # How much of the backdrop shows through: compare the panel's area with the backdrop alone.
+        inner = (natural["x"] + 24, natural["y"] + 24, natural["w"] - 48, natural["h"] - 48)
+        close_dashboard(menubar)
+        time.sleep(0.6)
+        behind = capture_screen("panel-behind", bounds(natural))
+
+        def fade(window: dict) -> tuple[dict, Path]:
+            slider = transparency_slider(pid, window)
+
+            def act() -> None:
+                for step in [0.15, 0.3, 0.45, 0.6, 0.75, 0.9, 0.75, 0.6]:
+                    set_transparency(pid, window, display, step, slider)
+                    time.sleep(0.15)
+            return window, record_during("fade", act, pad=0.6)[0]
+
+        window, video = steady(menubar, fade)
+        value = float(read_default("dashboardTransparency") or 0)
+        shown = f"{round(value * 100)}%"
+        tree = dashboard_texts(pid, window)
+        record(section, "点击仪表盘底栏滑块调节透明度", abs(value - 0.6) <= 0.03 and f'"{shown}"' in tree,
+               f"dashboardTransparency = {value:.3f}，底栏显示 {shown}", "目标 60%")
+        gif(video, display, around(window), SHOTS / "live-transparency.gif", menubar=menubar)
+        time.sleep(1.5)
+        window, clear = capture("08-dashboard-transparent")
+        crop(clear, SHOTS / "08-dashboard-transparent.png", around(window), menubar=menubar)
+        before = mean_difference(region_rgb(opaque, inner), region_rgb(behind, inner))
+        after = mean_difference(region_rgb(clear, inner), region_rgb(behind, inner))
+        record(section, "背后的壁纸透过面板显现 (像素对比)", after < before * 0.7,
+               f"面板区域与纯背景的平均色差 {before:.1f} → {after:.1f}", f"透明度 0% → {shown}，越小越接近背景")
+
+        # Resizing: the bottom-right corner, then single edges, down to the minimum.
+        def grow(window: dict) -> tuple[dict, Path, dict]:
+            video = record_during("resize", lambda: drag_edge(pid, window, display, "corner", 220, 140, 1200), pad=0.6)[0]
+            return window, video, dashboard_window() or window
+
+        window, video, grown = steady(menubar, grow)
+        record(section, "拖动右下角放大面板",
+               (grown["w"], grown["h"]) == (window["w"] + 220, window["h"] + 140) and (grown["x"], grown["y"]) == (window["x"], window["y"]),
+               f"{size(window)} → {size(grown)}，左上角不动", "拖动 +220, +140")
+        saved = (read_default("dashboardWidth"), read_default("dashboardHeight"))
+        record(section, "新尺寸写入偏好设置", saved == (str(grown["w"]), str(grown["h"])), " × ".join(saved))
+        gif(video, display, (window["x"] - margin, display.y, grown["w"] + 2 * margin,
+                             grown["y"] + grown["h"] + margin - display.y), SHOTS / "live-resize.gif", menubar=menubar)
+        time.sleep(1.5)
+        grown, frame = capture("09-dashboard-resized")
+        crop(frame, SHOTS / "09-dashboard-resized.png", around(grown), menubar=menubar)
+
+        grown, wider = resize("left", -120, 0)
+        expected = min(grown["w"] + 120, grown["x"] + grown["w"] - (display.x + 8))
+        record(section, "拖动左边缘加宽，右边缘不动", wider["w"] == expected and wider["x"] + wider["w"] == grown["x"] + grown["w"],
+               f"{size(grown)} → {size(wider)}")
+        wider, short = resize("bottom", 0, 100 - wider["h"])
+        short, shorter = resize("bottom", 0, -150)
+        record(section, "拖动下边缘缩小，停在内容的最小高度", short["h"] < natural["h"] and shorter["h"] == short["h"]
+               and short["y"] == wider["y"], f'{size(wider)} → {size(short)}，再上拖 150 pt 仍为 {shorter["h"]}',
+               f'最小高度小于默认的 {natural["h"]}')
+        shorter, narrow = resize("right", 100 - shorter["w"], 0)
+        record(section, "拖动右边缘缩小，停在最小宽度，左边缘不动", narrow["w"] == MIN_WIDTH and narrow["x"] == shorter["x"],
+               f"{size(shorter)} → {size(narrow)}", f"最小宽度 {MIN_WIDTH}")
+        time.sleep(1.5)
+        narrow, frame = capture("10-dashboard-minimum")
+        crop(frame, SHOTS / "10-dashboard-minimum.png", around(narrow), menubar=menubar)
+        tree = dashboard_texts(pid, narrow)
+        complete = all(t in tree for t in ('"CPU"', '"GPU"', '"内存"', '"网络"', '"温度与风扇"', "AXSlider (透明度)", "AXButton (退出)"))
+        record(section, "最小尺寸下内容完整 (界面文本)", complete, "5 类卡片、透明度滑块、底栏按钮都在")
+
+        close_dashboard(menubar)
+        window = open_dashboard(menubar)
+        record(section, "关闭后重新打开，保持上次的大小", (window["w"], window["h"]) == (narrow["w"], narrow["h"]),
+               size(window), f"上次 {size(narrow)}")
+        value = steady(menubar, lambda window: set_transparency(pid, window, display, 0))
+        record(section, "滑块调回 0%", value == 0, f"dashboardTransparency = {value:g}")
+
+    # The settings window shows both values and can put the size back.
+    window = open_dashboard(menubar)
+    settings = open_settings(pid, window)
+    record(section, "从仪表盘打开设置窗口", bool(settings), "已打开" if settings else "未打开")
+    if not settings:
+        return
+    tree = dashboard_texts(pid, settings)
+    listed = f'{window["w"]} × {window["h"]}'
+    record(section, "设置窗口显示当前面板大小与透明度", listed in tree and '"0%"' in tree, f"面板大小 {listed}，透明度 0%")
+    reset = ax_press(pid, settings["id"], r'\[(\d+)\] AXButton[^\n]*恢复默认')
+    time.sleep(1)
+    cleared = read_default("dashboardWidth") == "" and read_default("dashboardHeight") == ""
+    ax_press(pid, settings["id"], r'\[(\d+)\] AXButton \[actions=\[press\]\]\n\s*- \[\d+\] AXButton \[actions=\[press,showmenu\]\]')
+    wait_until(lambda: not any(w["layer"] == 0 and w["onscreen"] for w in windows("BarPulse")), 5)
+    window = open_dashboard(menubar)
+    close_dashboard(menubar)
+    record(section, "设置里「恢复默认」后回到默认大小", reset and cleared and (window["w"], window["h"]) == (natural["w"], natural["h"]),
+           size(window), f'默认 {size(natural)}')
 
 
 # ---------------------------------------------------------------- report
@@ -703,7 +1048,10 @@ def write_report(info: dict) -> None:
         f"- 时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"- 机器：{info['chip']} · {info['cpuCores']} 核 CPU · {info.get('gpuCores')} 核 GPU · {info['memory'] / 1024 ** 3:.0f} GB · {info['osVersion']}",
         "- 截图来源：Cua Driver 的 ScreenCaptureKit 整屏录制（真实屏幕像素，非离屏渲染）",
-        "- 交互方式：通过菜单栏 (MenuBarAgent) 的辅助功能树按下 BarPulse 状态栏项，与鼠标点击走同一路径",
+        "- 交互方式：通过菜单栏 (MenuBarAgent) 的辅助功能树按下 BarPulse 状态栏项，与鼠标点击走同一路径；"
+        "透明度滑块和面板边缘用直接投递给 BarPulse 的鼠标事件 (CGEvent) 点击、拖动，不移动系统指针",
+        "- 只在 Cua Driver 录制的副显示器上操作：仪表盘、设置窗口和背景板都不出现在主显示器上，也不抢键盘焦点",
+        "- 仪表盘截图时在面板后面铺一张系统自带壁纸 (Sonoma)，透过玻璃看到的是固定画面而不是当时打开的窗口",
         "",
     ]
     for section in dict.fromkeys(r["section"] for r in results):
@@ -721,11 +1069,17 @@ def write_report(info: dict) -> None:
         ("05-dashboard-dark", "深色外观"),
         ("06-menubar-inline-zoom", "单行图标样式"),
         ("07-menubar-monochrome-zoom", "单色样式"),
+        ("08-dashboard-transparent", "透明度 60%（底栏滑块拖动后）"),
+        ("09-dashboard-resized", "拖动右下角放大后的仪表盘（图表随之变大）"),
+        ("10-dashboard-minimum", "最小尺寸"),
     ]
     lines += ["## 截图", ""]
     for name, title in shots:
         if (SHOTS / f"{name}.png").exists():
             lines += [f"### {title}", "", f"![{title}](screenshots/{name}.png)", ""]
+    for name, title in [("live-transparency", "调节透明度 0% → 90% → 60%"), ("live-resize", "拖动右下角调整大小")]:
+        if (SHOTS / f"{name}.gif").exists():
+            lines += [f"### {title}", "", f"![{title}](screenshots/{name}.gif)", ""]
     lines += ["实时刷新动图：[live-menubar.gif](screenshots/live-menubar.gif) · 视频：[live-dashboard.mp4](screenshots/live-dashboard.mp4)", ""]
     (OUT / "README.md").write_text("\n".join(lines), encoding="utf-8")
 

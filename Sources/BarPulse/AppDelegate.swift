@@ -9,8 +9,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var settingsWindow = SettingsWindowController(settings: settings, store: store)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let controller = StatusItemController(store: store, settings: settings) { [weak self] in
-            self?.settingsWindow.show()
+        let controller = StatusItemController(store: store, settings: settings) { [weak self] screen in
+            self?.settingsWindow.show(on: screen)
         }
         statusController = controller
         store.onSample = { [weak controller] in controller?.refresh() }

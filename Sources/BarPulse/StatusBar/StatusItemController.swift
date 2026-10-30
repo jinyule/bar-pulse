@@ -3,15 +3,17 @@ import BarPulseCore
 import SwiftUI
 
 @MainActor
-final class StatusItemController: NSObject, NSPopoverDelegate {
+final class StatusItemController: NSObject {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let barView = StatusBarView()
-    private let popover = NSPopover()
+    private var panel: DashboardPanel?
+    private var dismissMonitors: [Any] = []
     private let store: MetricsStore
     private let settings: AppSettings
-    private let openSettings: () -> Void
+    /// Opens the settings window on the given screen (the one showing the status item).
+    private let openSettings: (NSScreen?) -> Void
 
-    init(store: MetricsStore, settings: AppSettings, openSettings: @escaping () -> Void) {
+    init(store: MetricsStore, settings: AppSettings, openSettings: @escaping (NSScreen?) -> Void) {
         self.store = store
         self.settings = settings
         self.openSettings = openSettings
@@ -35,39 +37,32 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
             button.setAccessibilityHelp("显示 CPU、GPU、内存、网速与温度仪表盘")
         }
 
-        popover.behavior = .transient
-        popover.animates = true
-        popover.delegate = self
-
         refresh()
     }
 
-    /// The dashboard is built on open and released on close, so a closed popover costs nothing:
+    /// The dashboard is built on open and released on close, so a closed panel costs nothing:
     /// no SwiftUI graph updates, no animations, no backing stores. History lives in the store.
-    private func makeDashboard() -> NSViewController {
+    private func makeDashboard() -> NSHostingController<DashboardView> {
         let dashboard = DashboardView(
             store: store,
             settings: settings,
             actions: DashboardActions(
                 openActivityMonitor: { [weak self] in self?.openActivityMonitor() },
                 openSettings: { [weak self] in
-                    self?.closePopover()
-                    self?.openSettings()
+                    self?.closeDashboard()
+                    self?.showSettings()
                 },
                 quit: { NSApp.terminate(nil) }
             )
         )
-        let host = NSHostingController(rootView: dashboard)
-        host.sizingOptions = [.preferredContentSize]
-        return host
+        return NSHostingController(rootView: dashboard)
     }
 
     /// Pushes the latest snapshot + settings into the menu bar view.
     func refresh() {
         let snapshot = store.snapshot
-        let appearance = settings.appearance.nsAppearance
-        if popover.appearance?.name != appearance?.name {
-            popover.appearance = appearance
+        if let panel {
+            applySettings(to: panel)
         }
         barView.model = StatusBarModel(
             metrics: settings.visibleMetrics,
@@ -89,46 +84,102 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         statusItem.button?.toolTip = tooltip(for: snapshot)
     }
 
-    func showPopover() {
-        guard let button = statusItem.button, !popover.isShown else { return }
-        let content = makeDashboard()
-        popover.contentViewController = content
-        // Size before showing so the popover doesn't open at a default size and then jump.
-        popover.contentSize = content.view.fittingSize
-        NSApp.activate()
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        popover.contentViewController?.view.window?.makeKey()
+    func showDashboard() {
+        guard panel == nil, let button = statusItem.button else { return }
+        let host = makeDashboard()
+        // Measure once: the natural size is the default, the minimum bounds resizing.
+        let ideal = host.view.intrinsicContentSize
+        let minimum = host.sizeThatFits(in: .zero)
+        host.sizingOptions = []
+
+        let panel = DashboardPanel(content: host)
+        panel.minimumSize = CGSize(width: minimum.width.rounded(.up), height: minimum.height.rounded(.up))
+        panel.idealSize = CGSize(width: ideal.width.rounded(.up), height: ideal.height.rounded(.up))
+        panel.onResize = { [weak self] size in self?.settings.dashboardSize = size }
+        panel.onCancel = { [weak self] in self?.closeDashboard() }
+        self.panel = panel
+        applySettings(to: panel)
+        panel.present()
         button.highlight(true)
+        installDismissMonitors()
     }
 
-    func closePopover() {
-        popover.performClose(nil)
-    }
-
-    func popoverDidClose(_ notification: Notification) {
+    func closeDashboard() {
+        guard let panel else { return }
+        self.panel = nil
+        dismissMonitors.forEach(NSEvent.removeMonitor)
+        dismissMonitors.removeAll()
+        NotificationCenter.default.removeObserver(self, name: NSApplication.didResignActiveNotification, object: nil)
         statusItem.button?.highlight(false)
-        popover.contentViewController = nil
+        panel.dismiss()
+    }
+
+    private func applySettings(to panel: DashboardPanel) {
+        let appearance = settings.appearance.nsAppearance
+        if panel.appearance?.name != appearance?.name {
+            panel.appearance = appearance
+        }
+        panel.backgroundOpacity = 1 - settings.dashboardTransparency
+        let size = settings.dashboardSize ?? panel.idealSize
+        if size != panel.requestedSize, let screen = statusItem.button?.window?.screen ?? NSScreen.main {
+            panel.place(below: statusItemFrame ?? .zero, on: screen, size: size)
+        }
+    }
+
+    /// The status item in screen coordinates.
+    private var statusItemFrame: NSRect? {
+        guard let button = statusItem.button, let window = button.window else { return nil }
+        return window.convertToScreen(button.convert(button.bounds, to: nil))
+    }
+
+    /// Closes the panel on a click anywhere else, or when the app loses focus, like a menu.
+    private func installDismissMonitors() {
+        let global = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                // The menu bar may be drawn by another process; a click on our own item then
+                // shows up here first, and the item's action toggles the panel by itself.
+                if self.statusItemFrame?.contains(NSEvent.mouseLocation) == true { return }
+                self.closeDashboard()
+            }
+        }
+        let local = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
+            MainActor.assumeIsolated {
+                guard let self, let panel = self.panel else { return }
+                if event.window !== panel && event.window !== self.statusItem.button?.window {
+                    self.closeDashboard()
+                }
+            }
+            return event
+        }
+        dismissMonitors = [global, local].compactMap { $0 }
+        NotificationCenter.default.addObserver(self, selector: #selector(applicationDidResignActive),
+                                               name: NSApplication.didResignActiveNotification, object: nil)
+    }
+
+    @objc private func applicationDidResignActive(_ notification: Notification) {
+        closeDashboard()
     }
 
     @objc private func handleClick(_ sender: NSStatusBarButton) {
         let event = NSApp.currentEvent
         if event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true {
             showMenu()
-        } else if popover.isShown {
-            closePopover()
+        } else if panel != nil {
+            closeDashboard()
         } else {
-            showPopover()
+            showDashboard()
         }
     }
 
     private func showMenu() {
         guard let button = statusItem.button else { return }
-        closePopover()
+        closeDashboard()
         let menu = NSMenu()
-        menu.addItem(item("打开仪表盘", symbol: "gauge.with.dots.needle.67percent") { [weak self] in self?.showPopover() })
+        menu.addItem(item("打开仪表盘", symbol: "gauge.with.dots.needle.67percent") { [weak self] in self?.showDashboard() })
         menu.addItem(item("活动监视器", symbol: "chart.bar.xaxis") { [weak self] in self?.openActivityMonitor() })
         menu.addItem(.separator())
-        menu.addItem(item("设置…", symbol: "gearshape", key: ",") { [weak self] in self?.openSettings() })
+        menu.addItem(item("设置…", symbol: "gearshape", key: ",") { [weak self] in self?.showSettings() })
         menu.addItem(.separator())
         menu.addItem(item("退出 BarPulse", symbol: "power", key: "q") { NSApp.terminate(nil) })
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.maxY + 5), in: button)
@@ -140,8 +191,12 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         return item
     }
 
+    private func showSettings() {
+        openSettings(statusItem.button?.window?.screen)
+    }
+
     private func openActivityMonitor() {
-        closePopover()
+        closeDashboard()
         let url = URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app")
         NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
     }

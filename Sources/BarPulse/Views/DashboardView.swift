@@ -17,24 +17,29 @@ struct DashboardView: View {
     private var info: SystemInfo { store.info }
     private var unit: TemperatureUnit { settings.temperatureUnit }
 
+    /// Debug aid for screenshots that get published: blanks out private data (the local IP).
+    private static let redactsPrivateData = ProcessInfo.processInfo.arguments.contains("--redact-private")
+
     var body: some View {
-        VStack(spacing: 12) {
+        // The panel is resizable: at its ideal size this is the original fixed layout, and any
+        // extra room goes to the charts.
+        StretchColumn(spacing: 12) {
             header
             HStack(alignment: .top, spacing: 12) {
                 cpuCard
                 gpuCard
             }
-            .fixedSize(horizontal: false, vertical: true)
             HStack(alignment: .top, spacing: 12) {
                 memoryCard
                 networkCard
             }
-            .fixedSize(horizontal: false, vertical: true)
             thermalCard
             footer
         }
         .padding(16)
-        .frame(width: 660)
+        .frame(minWidth: 640, idealWidth: 660, maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .environment(\.surfaceOpacity, 1 - settings.dashboardTransparency)
+        .redacted(reason: Self.redactsPrivateData ? .privacy : [])
     }
 
     // MARK: - Header
@@ -89,7 +94,7 @@ struct DashboardView: View {
                 ChartSeries(values: store.cpu.values, color: .cpu),
                 ChartSeries(values: store.cpuSystem.values, color: .cpuAlt, filled: false, lineWidth: 1.1),
             ])
-            .frame(height: 70)
+            .frame(minHeight: 44, idealHeight: 70, maxHeight: .infinity)
             CoreGrid(cores: cpu.cores, clusters: info.clusters)
             HStack {
                 StatItem(title: "用户", value: Format.precisePercent(cpu.user), dot: .cpu)
@@ -108,7 +113,7 @@ struct DashboardView: View {
                        subtitle: [info.gpuCores.map { "\($0) 核" }, "Metal"].compactMap { $0 }.joined(separator: " · "),
                        value: gpu.available ? Format.percent(gpu.usage) : "--")
             AreaChart(series: [ChartSeries(values: store.gpu.values, color: .gpu)])
-                .frame(minHeight: 70, maxHeight: .infinity)
+                .frame(minHeight: 44, idealHeight: 70, maxHeight: .infinity)
             MeterRow(title: "渲染器", fraction: gpu.renderer, color: .gpu)
             MeterRow(title: "拼贴器 (Tiler)", fraction: gpu.tiler, color: .gpu)
             HStack {
@@ -183,9 +188,9 @@ struct DashboardView: View {
                 rateBlock(title: "上传", symbol: "arrow.up", rate: network.uploadRate, color: .upload)
             }
             MirrorChart(download: store.download.values, upload: store.upload.values)
-                .frame(minHeight: 64, maxHeight: .infinity)
+                .frame(minHeight: 44, idealHeight: 64, maxHeight: .infinity)
             HStack {
-                StatItem(title: "本机 IP", value: network.localAddress ?? "--")
+                StatItem(title: "本机 IP", value: network.localAddress ?? "--", isPrivate: true)
                 StatItem(title: "本次下载", value: Format.bytes(network.sessionDownloaded), dot: .download)
                 StatItem(title: "本次上传", value: Format.bytes(network.sessionUploaded), dot: .upload)
             }
@@ -235,13 +240,14 @@ struct DashboardView: View {
                     // Only tint when it's a warning; yellow-green digits read poorly on light glass.
                     .foregroundStyle(headline.map { $0 >= 75 ? Color.heat($0) : .primary } ?? .primary)
             }
-            HStack(alignment: .top, spacing: 12) {
+            // The chart keeps the share of the width it has at the panel's natural size.
+            SplitRow(fraction: 0.4, spacing: 12) {
                 VStack(alignment: .leading, spacing: 6) {
                     AreaChart(series: [
                         ChartSeries(values: store.cpuTemperature.values, color: .thermal),
                         ChartSeries(values: store.gpuTemperature.values, color: .gpu, filled: false, lineWidth: 1.3),
                     ], range: 25...105)
-                    .frame(height: 96)
+                    .frame(minHeight: 60, idealHeight: 96, maxHeight: .infinity)
                     HStack(spacing: 12) {
                         legendDot("CPU", .thermal)
                         legendDot("GPU", .gpu)
@@ -251,7 +257,6 @@ struct DashboardView: View {
                             .foregroundStyle(.tertiary)
                     }
                 }
-                .frame(width: 236)
                 VStack(spacing: 8) {
                     Grid(horizontalSpacing: 8, verticalSpacing: 8) {
                         GridRow {
@@ -302,6 +307,7 @@ struct DashboardView: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
             Spacer()
+            TransparencyControl(value: Bindable(settings).dashboardTransparency)
             FooterButton(title: "活动监视器", symbol: "chart.bar.xaxis", action: actions.openActivityMonitor)
             FooterButton(title: "设置", symbol: "gearshape", action: actions.openSettings)
             FooterButton(title: "退出", symbol: "power", action: actions.quit)
